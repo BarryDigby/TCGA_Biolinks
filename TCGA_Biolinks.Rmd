@@ -1,0 +1,219 @@
+---
+title: "TCGA_analysis"
+author: "Barry"
+date: "07/07/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(root.dir = "~/Desktop/TCGA/")
+```
+
+```{R, messages = F}
+library(knitr)
+library(DESeq2)
+library(RColorBrewer)
+library(pheatmap)
+library(gplots)
+library(biomaRt)
+library(PCAtools)
+library(DT)
+library(IHW)
+library(apeglm)
+library(EnhancedVolcano)
+library(ComplexHeatmap)
+library(TCGAbiolinks)
+```
+
+## miRNA analysis
+```{R}
+mirna_query <- GDCquery(project = "TCGA-PRAD",
+                        data.category = "Transcriptome Profiling",
+                        data.type = "miRNA Expression Quantification",
+                        #workflow.type = "BCGSC miRNA Profiling",
+                        experimental.strategy = "miRNA-Seq")
+
+GDCdownload(mirna_query, method = "api", files.per.chunk = 100,
+            directory = "~/Desktop/TCGA/miRNA/")
+
+miR_df <- GDCprepare(mirna_query, directory = "~/Desktop/TCGA/miRNA/")
+
+## remove columns we dont need, keep counts
+rownames(miR_df) <- miR_df$miRNA_ID
+miR_df <- miR_df[,-1]
+number_cols <- ncol(miR_df)
+subset <- seq(from = 1, to = number_cols, by = 3)
+miR_df <- miR_df[, subset]
+
+## Strip read_count, just want the 'cases' ID
+colnames(miR_df) <- gsub(".*_","",colnames(miR_df))
+
+## Match to metadata
+miR_meta <- mirna_query[[1]][[1]]
+
+miR_meta <- miR_meta[,c("cases", "tissue.definition")]
+rownames(miR_meta) <- colnames(miR_df)
+table(rownames(miR_meta) == miR_meta$cases)
+
+## fix the levels that R thinks are there but are not
+miR_meta$tissue.definition <- as.character(miR_meta$tissue.definition)
+table(miR_meta$tissue.definition)
+
+## Remove metastatic sample
+metastatic_key <- miR_meta[which(miR_meta$tissue.definition == "Metastatic"),]
+
+miR_meta <- miR_meta[!miR_meta$tissue.definition == metastatic_key$tissue.definition,]
+miR_df <- miR_df[, -grep(paste0(metastatic_key$cases), colnames(miR_df))]
+
+## Rename conditions
+miR_meta$tissue.definition <- gsub("Primary solid Tumor", "Tumor", miR_meta$tissue.definition)
+miR_meta$tissue.definition <- gsub("Solid Tissue Normal", "Normal", miR_meta$tissue.definition)
+miR_meta$tissue.definition <- as.factor(miR_meta$tissue.definition)
+levels(miR_meta$tissue.definition)
+colnames(miR_meta) <- c("cases", "Condition")
+
+## tidy vars
+rm(mirna_query)
+rm(subset)
+rm(number_cols)
+rm(metastatic_key)
+
+## DESeq2 Analysis
+miR_dds <- DESeqDataSetFromMatrix(miR_df, colData = miR_meta, design = ~ Condition)
+miR_dds$Condition <- relevel(miR_dds$Condition, ref = "Normal")
+miR_dds <- DESeq(miR_dds)
+resultsNames(miR_dds)
+
+## DESeq2 results
+miR_res <- results(miR_dds, filterFun = ihw, alpha = 0.05, name = "Condition_Tumor_vs_Normal")
+summary(miR_res)
+miR_res_df <- as.data.frame(miR_res)
+
+## Function to grab results
+get_upregulated <- function(df){
+    key <- intersect(rownames(df)[which(df$log2FoldChange>=1)],
+              rownames(df)[which(df$pvalue<=0.05)])
+    
+    results <- as.data.frame((df)[which(rownames(df) %in% key),])
+    return(results)
+  }
+
+get_downregulated <- function(df){
+  key <- intersect(rownames(df)[which(df$log2FoldChange<=-1)],
+            rownames(df)[which(df$pvalue<=0.05)])
+  
+  results <- as.data.frame((df)[which(rownames(df) %in% key),])
+  return(results)
+}
+
+miR_upreg <- get_upregulated(miR_res)
+miR_downreg <- get_downregulated(miR_res)
+
+## Write results for plots and analysis
+miR_counts <- counts(miR_dds, normalized = T)
+write.table(miR_counts, "~/Desktop/TCGA/miRNA/results/miR_norm.counts.txt", quote = F, sep = "\t")
+
+
+miR_upreg$miRNA_id <- rownames(miR_upreg)
+miR_downreg$miRNA_id <- rownames(miR_downreg)
+miR_upreg <- miR_upreg[,c(8,1,2,3,4,5,6,7)]
+miR_downreg <- miR_downreg[,c(8,1,2,3,4,5,6,7)]
+write.table(miR_upreg, "~/Desktop/TCGA/miRNA/results/miR_upreg.txt", quote = F, sep = "\t", row.names = F)
+write.table(miR_downreg, "~/Desktop/TCGA/miRNA/results/miR_downreg.txt", quote = F, sep = "\t", row.names = F)
+
+## No need to run this block again. 
+```
+
+# mRNA analysis
+```{R}
+mrna_query <- GDCquery(project = "TCGA-PRAD",
+                      data.category = "Transcriptome Profiling",
+                      data.type = "Gene Expression Quantification",
+                      workflow.type = "HTSeq - Counts",
+                      experimental.strategy = "RNA-Seq")
+
+GDCdownload(mrna_query, method = "api", files.per.chunk = 100,
+            directory = "~/Desktop/TCGA/mRNA/")
+
+mrna_df <- GDCprepare(mrna_query, directory = "~/Desktop/TCGA/mRNA/")
+
+mrna_meta <- mrna_df$sample
+mrna_meta <- cbind(mrna_meta, mrna_df$definition)
+mrna_df <- assay(mrna_df)
+
+## tidy matrix colnames 
+delim_fn = function(x, n, i){
+    do.call(c, lapply(x, function(X)
+        paste(unlist(strsplit(X, "-"))[(n+1):(i)], collapse = "-")))
+}
+
+colnames(mrna_df) <- delim_fn(x = colnames(mrna_df), n = 0, i = 4)
+
+mrna_meta <- as.data.frame(mrna_meta)
+mrna_df <- as.data.frame(mrna_df)
+
+## remove the metastatic sample from counts matrix and metadata 
+metastatic_key <- mrna_meta[which(mrna_meta[,2] == "Metastatic"),]
+mrna_meta <- mrna_meta[!mrna_meta[,2] == metastatic_key[,2],]
+mrna_df <- mrna_df[, -grep(paste0(metastatic_key[,1]), colnames(mrna_df))]
+
+## fix the levels that R thinks are there but are not
+mrna_meta[,2] <- as.character(mrna_meta[,2])
+
+## Rename conditions
+mrna_meta[,2] <- gsub("Primary solid Tumor", "Tumor", mrna_meta[,2])
+mrna_meta[,2] <- gsub("Solid Tissue Normal", "Normal", mrna_meta[,2])
+mrna_meta[,2] <- as.factor(mrna_meta[,2])
+levels(mrna_meta[,2])
+colnames(mrna_meta) <- c("cases", "Condition")
+
+
+## filter for protein coding genes in matrix (currently > 50,000 rows)
+mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+
+mrna_attributes <- getBM(attributes=c("external_gene_name",
+                                      "ensembl_gene_id",
+                                      "gene_biotype"),
+                         filters = c("ensembl_gene_id"),
+                         values = rownames(mrna_df),
+                         mart = mart)
+
+mrna_attributes <- mrna_attributes[which(mrna_attributes$gene_biotype == "protein_coding"),]
+
+mrna_df <- mrna_df[which(rownames(mrna_df) %in% mrna_attributes$ensembl_gene_id),]
+mrna_df$Gene_id <- mrna_attributes$external_gene_name
+## 3 gene names are duplicated 'PINX1' 'TMSB15B' 'MATR3'
+## append numerics to names to make unique
+rownames(mrna_df) <- make.names(mrna_df$Gene_id, unique = T)
+mrna_df <- mrna_df[,1:550]
+
+
+## DESeq2 Analysis
+mrna_dds <- DESeqDataSetFromMatrix(mrna_df, colData = mrna_meta, design = ~ Condition)
+mrna_dds$Condition <- relevel(mrna_dds$Condition, ref = "Normal")
+mrna_dds <- DESeq(mrna_dds)
+resultsNames(mrna_dds)
+
+## DESeq2 results
+mrna_res <- results(mrna_dds, filterFun = ihw, alpha = 0.05, name = "Condition_Tumor_vs_Normal")
+summary(mrna_res)
+mrna_res_df <- as.data.frame(mrna_res)
+
+mrna_upreg <- get_upregulated(mrna_res)
+mrna_downreg <- get_downregulated(mrna_res)
+
+## Write results for plots and analysis
+mrna_counts <- counts(mrna_dds, normalized = T)
+write.table(mrna_counts, "~/Desktop/TCGA/mRNA/results/mRNA_norm.counts.txt", quote = F, sep = "\t")
+
+
+mrna_upreg$Gene_id <- rownames(mrna_upreg)
+mrna_downreg$Gene_id <- rownames(mrna_downreg)
+mrna_upreg <- mrna_upreg[,c(8,1,2,3,4,5,6,7)]
+mrna_downreg <- mrna_downreg[,c(8,1,2,3,4,5,6,7)]
+write.table(mrna_upreg, "~/Desktop/TCGA/mRNA/results/mRNA_upreg.txt", quote = F, sep = "\t", row.names = F)
+write.table(mrna_downreg, "~/Desktop/TCGA/mRNA/results/mRNA_downreg.txt", quote = F, sep = "\t", row.names = F)
+
+## No need to run this block again. 
+```
